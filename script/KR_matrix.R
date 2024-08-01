@@ -1,0 +1,119 @@
+library(data.table)
+library(readxl)
+
+generate_contact_matrices <- function(participant_data, contact_data, population_file, population_sheet) {
+  # Function to generate bootstrapped contact matrices
+  # participant_data: Database containing participant information
+  # contact_data: Database containing contact information
+  # population_file: Excel file with population size for different age groups
+  # population_sheet: Sheet number in the population_file (2 for Shanghai, 1 for Wuhan)
+  
+  # Read population data from Excel file
+  population <- read_xlsx(population_file, sheet = population_sheet)
+  population$freq <- as.numeric(population$freq)
+  
+  # Calculate population proportions
+  population_proportions <- population$freq / sum(population$freq, na.rm = TRUE)
+  
+  # Calculate sample sizes for each age group
+  sample_sizes <- round(nrow(participant_data) * population_proportions)
+  
+  age_groups <- levels(participant_data$age_group5)
+  
+  # Define age group boundaries
+  age_limits <- c(0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75)
+  
+  contact_matrices <- vector("list", 100)
+  
+  # Generate 10,000 bootstrapped matrices
+  for (iteration in 1:10000) {
+    sampled_participants <- data.table()
+    sampled_contacts <- data.table()
+    
+    # Sample participants and their contacts for each age group
+    for (age_group_index in seq_along(age_groups)) {
+      current_age_group <- age_groups[age_group_index]
+      participants_in_group <- participant_data[age_group5 == current_age_group]
+      
+      if (nrow(participants_in_group) > 0) {
+        sampled_ids <- sample(participants_in_group$subid, size = sample_sizes[age_group_index], replace = TRUE)
+        
+        for (i in seq_along(sampled_ids)) {
+          participant <- participants_in_group[subid == sampled_ids[i]]
+          participant_contacts <- contact_data[subid == sampled_ids[i]]
+          
+          # Assign unique participant IDs
+          participant$part_id <- paste0(participant$subid, i)
+          participant_contacts$part_id <- paste0(participant_contacts$subid, i)
+          
+          # Combine sampled data
+          sampled_participants <- rbind(sampled_participants, participant)
+          sampled_contacts <- rbind(sampled_contacts, participant_contacts)
+        }
+      }
+    }
+    
+    # Convert participant IDs to numeric and set as key for faster operations
+    sampled_participants[, part_id := as.numeric(part_id)]
+    setkey(sampled_participants, part_id)
+    
+    sampled_contacts[, part_id := as.numeric(part_id)]
+    setkey(sampled_contacts, part_id)
+    
+    # Convert contact age columns to numeric
+    age_cols <- c("cnt_age_exact", "cnt_age_est_min", "cnt_age_est_max")
+    sampled_contacts[, (age_cols) := lapply(.SD, as.numeric), .SDcols = age_cols]
+    
+    # Impute missing exact ages with a random value between estimated min and max
+    sampled_contacts[is.na(cnt_age_exact) & !is.na(cnt_age_est_min) & !is.na(cnt_age_est_max), 
+                     cnt_age_exact := sapply(.I, function(i) sample(round(cnt_age_est_min[i]):round(cnt_age_est_max[i]), 1))]
+    
+    # Generate survey object
+    contact_survey <- survey(sampled_participants, sampled_contacts)
+    
+    # Create contact matrix
+    contact_matrix <- contact_matrix(
+      contact_survey, 
+      age.limits = age_limits, 
+      symmetric = TRUE, 
+      missing.contact.age = "sample", 
+      n = 1
+    )
+    
+    # Replace NA values with 0 in the matrix
+    matrix_data <- contact_matrix$matrix
+    matrix_data[is.na(matrix_data)] <- 0
+    
+    # Store the generated matrix
+    contact_matrices[[iteration]] <- matrix_data
+  }
+  
+  return(contact_matrices)
+}
+
+# Read and prepare participant data
+participant_file <- "D:/KR/contact/analysis/SouthKorea_participant_common.xlsx"
+participant_data <- read_xlsx(path = participant_file) %>%
+  select(subid = part_id, part_age) %>%
+  mutate(
+    country = "Korea",
+    age_group5 = cut(part_age, breaks = c(seq(0, 75, 5), 100), right = FALSE, labels = FALSE)
+  ) %>%
+  as.data.table()
+
+# Read and prepare contact data
+contact_file <- "D://KR/contact/analysis/SouthKorea_contact_common.xlsx"
+contact_data <- read_xlsx(path = contact_file) %>%
+  select(subid = part_id, cnt_age_exact, cnt_age_est_min, cnt_age_est_max) %>%
+  as.data.table()
+
+# Generate bootstrapped matrices
+bootstrapped_matrices <- generate_contact_matrices(
+  participant_data = participant_data,
+  contact_data = contact_data,
+  population_sheet = 1,
+  population_file = "D:/KR/contact/analysis/KR_population_2023.xlsx"
+)
+
+# Calculate mean bootstrapped matrix
+mean_bootstrapped_matrix <- Reduce(`+`, bootstrapped_matrices) / length(bootstrapped_matrices)
